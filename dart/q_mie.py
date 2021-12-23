@@ -3,6 +3,17 @@
 """
 Created on Fri Dec 10 21:49:25 2021
 
+This module provied the functionality to calculate opacities for spherical
+grains. The routines for the MIE calculations are taken form the LX-MIE
+Mie scattering code. Details can be found in Kitzmann&Heng (2017),
+https://arxiv.org/abs/1710.04946 . When used reference to this paper should be
+given. The routines listed below are a python implementation of the original
+code was written in C++, with slight modifications to the in and output
+functionality.
+
+The Functionality valid in the large or small grain limts (geometric optics, 
+respectively, Rayleigh) are taken fron Bohren & Huffman and Irvine 1963.
+
 @author: bouwman
 """
 import numpy as np
@@ -11,14 +22,16 @@ import numba as nb
 from numba import float64, complex128, int64, void
 from numba.types import UniTuple
 
+# limits used for the MIE calculations
 continued_fraction_max_terms = 10000001
 continued_fraction_epsilon = 1e-10
-
+# limits to ckeck if geometric optics are valid
 geometric_optics_size_parameter_limit = 500.0
 geometric_optics_absorbance_limit = 1.e-5
 geometric_optics_reflectance_limit = 1.0
-
+# limits to ckeck if Rayleigh limit is valid
 rayleigh_size_parameter_limit = 0.5
+rayleigh_size_refraction_limit = 0.5
 
 NaN = float64('nan')
 
@@ -106,10 +119,6 @@ def startingANcontinuedFractions(nb_mie_terms, mx):
   
     return function_numerator / function_denominator - (nb_mie_terms*1.)/mx
 
-
-
-#@nb.jit(UniTuple(complex128[:], 2)(int64, complex128, float64), nopython=True, cache=True)
-#def calcMieCoefficients(nb_mie_terms, refractive_index, size_parameter): 
 @nb.jit(void(int64, complex128, float64, complex128[:], complex128[:]), nopython=True, cache=True)
 def calcMieCoefficients(nb_mie_terms, refractive_index, size_parameter,
                         mie_coeff_a,  mie_coeff_b):
@@ -140,23 +149,20 @@ def calcMieCoefficients(nb_mie_terms, refractive_index, size_parameter,
     m = refractive_index
     mx = m * x
 
-#    mie_coeff_a = np.zeros((nb_mie_terms), dtype=complex128)
-#    mie_coeff_b = np.zeros((nb_mie_terms), dtype=complex128)
-
-    # //First, calculate A_n via backward recursion
-    # //Note that we need A_N(mx), a complex number, and A_N(x), a real number (see Eq. 17)
-    # //We use the Mie a-coefficient to store the complex values and the Mie b-coefficients for the real numbers
+    # First, calculate A_n via backward recursion
+    # Note that we need A_N(mx), a complex number, and A_N(x), a real number (see Eq. 17)
+    # We use the Mie a-coefficient to store the complex values and the Mie b-coefficients for the real numbers
     mie_coeff_a[-1] = startingANcontinuedFractions(nb_mie_terms, mx)
     mie_coeff_b[-1] = startingANcontinuedFractions(nb_mie_terms, x)
 
-    # //backward recursion
+    # backward recursion
     # reversed function does not work in numba 0.54.
     # (should get implemented in later versions)
     # for n in reversed(range(1, nb_mie_terms)):
     for i in range(1, nb_mie_terms):
         n = nb_mie_terms+1-i
-        mie_coeff_a[n-1] = (n*1.)/mx - 1./( (1.*n)/mx + mie_coeff_a[n])
-        mie_coeff_b[n-1] = ((n*1.)/x - 1./( (1.*n)/x + mie_coeff_b[n].real))
+        mie_coeff_a[n-1] = n/mx - 1.0/(n/mx + mie_coeff_a[n])
+        mie_coeff_b[n-1] = n/x - 1.0/(n/x + mie_coeff_b[n].real)
 
     # //Now we do a forward recursion to calculate B_n, C_n, and the Mie coefficients a_n and b_n
     C_n = 0.0 + 0.0j
@@ -165,7 +171,7 @@ def calcMieCoefficients(nb_mie_terms, refractive_index, size_parameter,
     # //n=1
     C_n = 1.0 + 1.0j*(np.cos(x) + x * np.sin(x)) / (np.sin(x) - x * np.cos(x))
     C_n = 1./C_n
-    D_n = (-1.)/x + 1.0/((1.)/x - D_n)
+    D_n = -1.0/x + 1.0/(1.0/x - D_n)
 
     A_n = mie_coeff_a[1]
     A_n_r = mie_coeff_b[1].real
@@ -178,14 +184,14 @@ def calcMieCoefficients(nb_mie_terms, refractive_index, size_parameter,
         A_n = mie_coeff_a[n]
         A_n_r = mie_coeff_b[n].real
 
-        D_n = (-1.*n)/x + 1.0/((1.*n)/x - D_n)
-        C_n = C_n * ( D_n + (1.*n)/x )/(A_n_r + (1.*n)/x )
+        D_n = -n/x + 1.0/(n/x - D_n)
+        C_n = C_n * (D_n + n/x)/(A_n_r + n/x)
 
         mie_coeff_a[n] = C_n * (A_n / m - A_n_r) / (A_n / m - D_n)
         mie_coeff_b[n] = C_n * (A_n * m - A_n_r) / (A_n * m - D_n)
-#    return mie_coeff_a, mie_coeff_b
 
-@nb.jit(UniTuple(float64, 3)(float64, complex128[:], complex128[:]),
+
+@nb.jit(UniTuple(float64, 4)(float64, complex128[:], complex128[:]),
         nopython=True, cache=True)
 def calcMieEfficiencies(size_parameter, mie_coeff_a, mie_coeff_b):
     """
@@ -211,22 +217,28 @@ def calcMieEfficiencies(size_parameter, mie_coeff_a, mie_coeff_b):
         DESCRIPTION.
 
     """
-    q_ext = 0.0
-    q_sca = 0.0
-    for n in range(1, mie_coeff_a.size):
-        q_sca += (2.*n + 1.) * (np.abs(mie_coeff_a[n]) *
-                                np.abs(mie_coeff_a[n]) +
-                                np.abs(mie_coeff_b[n]) *
-                                np.abs(mie_coeff_b[n]))
-        q_ext += (2.*n + 1.) * np.real(mie_coeff_a[n] + mie_coeff_b[n])
+    # q_ext = 0.0
+    # q_sca = 0.0
+    # #q_bac = 0.0+0.0j
+    # for n in range(1, mie_coeff_a.size):
+    #     q_sca += (2.0*n + 1.0) * (np.abs(mie_coeff_a[n])**2 +
+    #                               np.abs(mie_coeff_b[n])**2)
+    #     q_ext += (2.0*n + 1.0) * np.real(mie_coeff_a[n] + mie_coeff_b[n])
+    #     #q_bac += (2.0*n + 1.0) * (-1**n) * (mie_coeff_a[n] - mie_coeff_b[n])
 
-    q_sca *= 2./(size_parameter*size_parameter)
-    q_ext *= 2./(size_parameter*size_parameter)
-  
+
+    n = np.arange(1, mie_coeff_a.size)
+    cn = 2.0 * n + 1.0
+    q_ext = 2 * np.sum(cn * (mie_coeff_a.real[1:] + mie_coeff_b.real[1:])) / size_parameter**2
+    q_sca = 2 * np.sum(cn * (np.abs(mie_coeff_a[1:])**2 + np.abs(mie_coeff_b[1:])**2)) / size_parameter**2
+    q_bac = np.abs(np.sum((-1)**n * cn * (mie_coeff_a[1:] - mie_coeff_b[1:])))**2 / size_parameter**2
+
+    # #q_bac = (q_bac.real**2 + q_bac.imag**2) / (4.0 *np.pi*size_parameter**2)
+    # q_sca *= 2.0 / size_parameter**2
+    # q_ext *= 2.0 / size_parameter**2
     q_abs = q_ext - q_sca
 
-    return  q_ext, q_sca, q_abs
-
+    return  q_ext, q_sca, q_abs, q_bac
 
 @nb.jit(float64(float64, float64, complex128[:], complex128[:]),
         nopython=True, cache=True)
@@ -255,67 +267,115 @@ def calcAsymmetryParameter(q_sca, size_parameter, mie_coeff_a, mie_coeff_b):
     g = 0
     
     for n in range(1, mie_coeff_a.size-1):
-        g += n*(n + 2.0) / (n + 1.0) * \
+        cn = 2.0 * n + 1.0
+        c1n = n * (n + 2.0) / (n + 1.0)
+        c2n = cn / n / (n + 1.0)
+        g += c1n * \
             np.real(mie_coeff_a[n] * np.conj(mie_coeff_a[n+1]) +
                     mie_coeff_b[n] * np.conj(mie_coeff_b[n+1])) + \
-            (2.0*n + 1.0) / (n * (n + 1.0)) * \
-            np.real(mie_coeff_a[n] * np.conj(mie_coeff_b[n]))
+            c2n * np.real(mie_coeff_a[n] * np.conj(mie_coeff_b[n]))
   
     return g * 4./(size_parameter * size_parameter * q_sca)
 
-@nb.jit(void(float64, float64[:], float64[:]),
-        nopython=True, cache=True)
-def calcAngularFunctions(angle, pi_n, tau_n):
-    """
-    Calculate the angular eigenfunction pi and tau at a specified angle (Eq. 6)
-    Instead of evaluating the Legendre polynomials directly, we employ upward recurrence relations
-    We here follow the notation of Wiscombe (1979)
+# @nb.jit(void(float64, float64[:], float64[:]),
+#         nopython=True, cache=True)
+# def calcAngularFunctions(angle, pi_n, tau_n):
+#     """
+#     Calculate the angular eigenfunction pi and tau at a specified angle (Eq. 6)
+#     Instead of evaluating the Legendre polynomials directly, we employ upward recurrence relations
+#     We here follow the notation of Wiscombe (1979)
 
-    Parameters
-    ----------
-    angle : TYPE
-        DESCRIPTION.
-    pi_n : TYPE
-        DESCRIPTION.
-    tau_n : TYPE
-        DESCRIPTION.
+#     Parameters
+#     ----------
+#     angle : TYPE
+#         DESCRIPTION.
+#     pi_n : TYPE
+#         DESCRIPTION.
+#     tau_n : TYPE
+#         DESCRIPTION.
 
-    Returns
-    -------
-    None.
+#     Returns
+#     -------
+#     None.
 
-    """
-    pi_n[0] = 0.0
-    pi_n[1] = 1.0
+#     """
+#     pi_n[0] = 0.0
+#     pi_n[1] = 1.0
   
-    for n in range(1, pi_n.size-1):
-        s = angle * pi_n[n]
-        t = s - pi_n[n-1]
+#     for n in range(1, pi_n.size-1):
+#         s = angle * pi_n[n]
+#         t = s - pi_n[n-1]
   
-        pi_n[n+1] = s + (n + 1.0)/(n*1.0) * t
+#         pi_n[n+1] = s + (n + 1.0)/(n*1.0) * t
   
-        tau_n[n] = n * t - pi_n[n-1]
+#         tau_n[n] = n * t - pi_n[n-1]
   
-    n = pi_n.size-1
+#     n = pi_n.size-1
   
-    s = angle * pi_n[n]
-    t = s - pi_n[n-1]
+#     s = angle * pi_n[n]
+#     t = s - pi_n[n-1]
 
-    tau_n[n] = n * t - pi_n[n-1]
+#     tau_n[n] = n * t - pi_n[n-1]
+
+# @nb.jit(UniTuple(complex128, 2)(float64, complex128[:], complex128[:]),
+#         nopython=True, cache=True)
+# def calcScatteringAmplitudes(angle, mie_coeff_a, mie_coeff_b):
+#     """
+#     Calculate the scattering amplitudes S_1 and S_2 at a specified angle
+#     The Mie intensities in Eq. 5 are given by i_1 = (abs[S_1])^2, i_2 = (abs[S_2])^2
+#     The intensities/amplitudes can be used to calculate the scattering phase function (see Eq. 7)
+#     See Wiscombe (1979) for the recurrence relations used below
+
+#     Parameters
+#     ----------
+#     angle : TYPE
+#         DESCRIPTION.
+#     mie_coeff_a : TYPE
+#         DESCRIPTION.
+#     mie_coeff_b : TYPE
+#         DESCRIPTION.
+
+#     Returns
+#     -------
+#     s_1 : TYPE
+#         DESCRIPTION.
+#     s_2 : TYPE
+#         DESCRIPTION.
+
+#     """
+#     pi_n = np.zeros((mie_coeff_a.size))
+#     tau_n = np.zeros((mie_coeff_a.size))
+  
+#     calcAngularFunctions(angle, pi_n, tau_n)
+  
+#     s_plus = 0.0 + 0.0j
+#     s_minus = 0.0 + 0.0j
+  
+#     for n in range(1, pi_n.size):
+#         s_plus  += (2.*n + 1.0)/(n * (n + 1.0)) * \
+#             (mie_coeff_a[n] + mie_coeff_b[n]) * (pi_n[n] + tau_n[n])
+#         s_minus += (2.*n + 1.0)/(n * (n + 1.0)) * \
+#             (mie_coeff_a[n] - mie_coeff_b[n]) * (pi_n[n] - tau_n[n])
+  
+#     s_1 = 0.5 * (s_plus + s_minus) 
+#     s_2 = 0.5 * (s_plus - s_minus) 
+#     return s_1, s_2
+
 
 @nb.jit(UniTuple(complex128, 2)(float64, complex128[:], complex128[:]),
         nopython=True, cache=True)
-def calcScatteringAmplitudes(angle, mie_coeff_a, mie_coeff_b):
+def calcScatteringAmplitudes(cos_angle, mie_coeff_a, mie_coeff_b):
     """
-    Calculate the scattering amplitudes S_1 and S_2 at a specified angle
-    The Mie intensities in Eq. 5 are given by i_1 = (abs[S_1])^2, i_2 = (abs[S_2])^2
-    The intensities/amplitudes can be used to calculate the scattering phase function (see Eq. 7)
-    See Wiscombe (1979) for the recurrence relations used below
+    Calculate the scattering amplitude functions for spheres.
+
+    The amplitude functions have been normalized so that when integrated
+    over all 4*pi solid angles, the integral will be qext*pi*x**2.
+    The units are weird, sr**(-0.5)
 
     Parameters
     ----------
-    angle : TYPE
-        DESCRIPTION.
+    cos_angle : TYPE
+        Drray of angles, cos(theta), to calculate scattering amplitudes
     mie_coeff_a : TYPE
         DESCRIPTION.
     mie_coeff_b : TYPE
@@ -323,29 +383,40 @@ def calcScatteringAmplitudes(angle, mie_coeff_a, mie_coeff_b):
 
     Returns
     -------
-    s_1 : TYPE
-        DESCRIPTION.
-    s_2 : TYPE
-        DESCRIPTION.
-
+    S1 : TYPE
+        S1, S2: the scattering amplitudes at each angle mu [sr**(-0.5)]
+    S2 : TYPE
+        S1, S2: the scattering amplitudes at each angle mu [sr**(-0.5)]
     """
-    pi_n = np.zeros((mie_coeff_a.size))
-    tau_n = np.zeros((mie_coeff_a.size))
-  
-    calcAngularFunctions(angle, pi_n, tau_n)
-  
-    s_plus = 0.0 + 0.0j
-    s_minus = 0.0 + 0.0j
-  
-    for n in range(1, pi_n.size):
-        s_plus  += (2.*n + 1.0)/(n * (n + 1.0)) * \
-            (mie_coeff_a[n] + mie_coeff_b[n]) * (pi_n[n] + tau_n[n])
-        s_minus += (2.*n + 1.0)/(n * (n + 1.0)) * \
-            (mie_coeff_a[n] - mie_coeff_b[n]) * (pi_n[n] - tau_n[n])
-  
-    s_1 = 0.5 * (s_plus + s_minus)
-    s_2 = 0.5 * (s_plus - s_minus)
-    return s_1, s_2
+    a = mie_coeff_a[1:]
+    b = mie_coeff_b[1:]
+
+    S1 = 0.0 + 0.0j
+    S2 = 0.0 + 0.0j
+
+    nstop = len(a)
+
+    pi_nm2 = 0
+    pi_nm1 = 1
+    for n in range(1, nstop):
+        tau_nm1 = n * cos_angle * pi_nm1 - (n + 1) * pi_nm2
+        S1 += (2 * n + 1) * (pi_nm1 * a[n-1]
+                                + tau_nm1 * b[n-1]) / (n + 1) / n
+        S2 += (2 * n + 1) * (tau_nm1 * a[n-1]
+                                + pi_nm1 * b[n-1]) / (n + 1) / n
+        temp = pi_nm1
+        pi_nm1 = ((2 * n + 1) * cos_angle * pi_nm1 - (n + 1) * pi_nm2) / n
+        pi_nm2 = temp
+
+    # calculate norm = sqrt(pi * Qext * x**2)
+    n = np.arange(1, nstop+1)
+    norm = np.sqrt(2 * np.pi * np.sum((2 * n + 1) * (a.real + b.real)))
+
+    S1 /= norm
+    S2 /= norm
+
+    return S1, S2
+
 
 @nb.jit(void(complex128[:], complex128[:], int64, complex128[:], complex128[:]),
         nopython=True, cache=True)
@@ -495,9 +566,9 @@ def numberOfMieTerms(size_parameter):
         DESCRIPTION.
 
     """
-    return ( size_parameter + 4.3 * np.power(size_parameter, 1./3.) + 2)
+    return int( size_parameter + 4.3 * np.power(size_parameter, 1./3.) + 2)
 
-@nb.jit(UniTuple(float64, 4)(complex128, float64), nopython=True, cache=True)
+@nb.jit(UniTuple(float64, 5)(complex128, float64), nopython=True, cache=True)
 def Mie(refractive_index, size_parameter):
     """
     Mie calculations.
@@ -529,13 +600,13 @@ def Mie(refractive_index, size_parameter):
   
     calcMieCoefficients(nb_mie_terms, refractive_index, size_parameter,
                         mie_coeff_a, mie_coeff_b)
-    q_ext, q_sca, q_abs = \
+    q_ext, q_sca, q_abs, q_bac = \
         calcMieEfficiencies(size_parameter, mie_coeff_a, mie_coeff_b)
   
     asymmetry_parameter = \
         calcAsymmetryParameter(q_sca, size_parameter, mie_coeff_a, mie_coeff_b)
 
-    return q_ext, q_sca, q_abs, asymmetry_parameter
+    return q_ext, q_sca, q_abs, q_bac, asymmetry_parameter
 
 @nb.jit([float64(complex128, complex128, float64, float64),
          float64[:](complex128[:], complex128[:], float64, float64)],
@@ -588,7 +659,7 @@ def reflection(theta_i, refractive_index):
     Notes
     -----
     For details see Section 2.7 and Chapter 7 of Bohren and Huffman.
-    Note that the use of this is only valif for a size parameter > 1
+    Note that the use of this is only valid for a size parameter >> 1
     
     """     
     sin_theta_t = np.sin(theta_i)/refractive_index
@@ -697,7 +768,7 @@ def asymmetryFactorGeometricOptics(refractive_index):
     if np.abs(refractive_index.real - 1.0) < 1.e-6:
         return 1.0
     n_angles = 2000
-    sigma = np.linspace(0.0, 0.999, n_angles+1)
+    sigma = np.linspace(0.0, 1.0, n_angles+1)
     
     r_term1 = np.sqrt(1.0-sigma)
     r_term2 = np.sqrt(1.0-sigma/refractive_index.real**2)
@@ -720,7 +791,7 @@ def asymmetryFactorGeometricOptics(refractive_index):
     g = 0.5*(1+gamma)
     return g
 
-@nb.jit([UniTuple(float64, 4)(complex128, float64)],
+@nb.jit([UniTuple(float64, 5)(complex128, float64)],
         nopython=True, cache=True)
 def calcMieEfficienciesGeometricOptics(refractive_index, size_parameter):
     """
@@ -746,32 +817,19 @@ def calcMieEfficienciesGeometricOptics(refractive_index, size_parameter):
     -----
     See chapter 7 Bohren & Huffman
     """
-    if size_parameter < geometric_optics_size_parameter_limit:
-        # x >> 1
-        return NaN, NaN, NaN, NaN
-    elif np.abs(refractive_index.imag) < geometric_optics_absorbance_limit:
+
+    if np.abs(refractive_index.imag) < geometric_optics_absorbance_limit:
         # k ~ 0
         q_ext = 2.0
         q_sca = 2.0
         q_abs = 0.0
-        if refractive_index.real < geometric_optics_reflectance_limit:
-            # n > 1
-            asymmetry_parameter = NaN
-        else:
-            asymmetry_parameter = asymmetryFactorGeometricOptics(refractive_index)
-    elif 2.0*size_parameter*np.abs(refractive_index.imag) < 1:
-        # 2x|k| > 1
-            return NaN, NaN, NaN, NaN
     else:
         q_sca = QscaGeometricOptics(refractive_index)
         q_ext = 2.0
         q_abs = q_ext-q_sca
-        if refractive_index.real < geometric_optics_reflectance_limit:
-            # n > 1
-            asymmetry_parameter = NaN
-        else:
-            asymmetry_parameter = asymmetryFactorGeometricOptics(refractive_index)
-    return q_ext, q_sca, q_abs, asymmetry_parameter  
+    q_bac = reflection(0.0, refractive_index)
+    asymmetry_parameter = 1-(1-q_abs)/q_sca
+    return q_ext, q_sca, q_abs, q_bac, asymmetry_parameter  
 
 
 @nb.jit([UniTuple(float64, 4)(complex128, float64)],
@@ -802,7 +860,8 @@ def calcMieEfficienciesRayleigh(refractive_index, size_parameter):
     if size_parameter > rayleigh_size_parameter_limit:
         # check x << 1
         return NaN, NaN, NaN, NaN
-    elif size_parameter*np.abs(refractive_index) >= 0.5:
+    elif size_parameter*np.abs(refractive_index) >= \
+        rayleigh_size_refraction_limit:
         # check |m|x << 1
         return NaN, NaN, NaN, NaN
     C=(refractive_index**2-1.0)/(refractive_index**2+2.0)
